@@ -40,6 +40,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSession;
 import javax.servlet.Filter;
 import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
 import javax.servlet.Servlet;
 import javax.servlet.ServletConfig;
 import javax.servlet.ServletContext;
@@ -93,6 +94,7 @@ import org.ops4j.util.property.DictionaryPropertyResolver;
 import org.osgi.framework.Bundle;
 import org.osgi.framework.BundleContext;
 import org.osgi.framework.ServiceReference;
+import org.osgi.framework.wiring.BundleWiring;
 import org.osgi.service.http.HttpContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -350,6 +352,8 @@ public class ServerControllerTest {
 			properties.put(PaxWebConfig.PID_CFG_LOG_NCSA_ENABLED, "true");
 			properties.put(PaxWebConfig.PID_CFG_LOG_NCSA_LOGDIR, "target/ncsa");
 
+			properties.put(PaxWebConfig.PID_CFG_SERVER_THREAD_NAME_PREFIX, "XNIO-registerSingleServletUsingExplicitBatch");
+
 			if (runtime == Runtime.JETTY) {
 				// this file should be used to reconfigure thread pool already set inside Pax Web version of Jetty Server
 				properties.put(PaxWebConfig.PID_CFG_SERVER_CONFIGURATION_FILES, "target/test-classes/jetty-server.xml");
@@ -435,10 +439,10 @@ public class ServerControllerTest {
 
 		controller.sendBatch(batch);
 
-		String response = get(port, "/c/s/1", "Let-Me-In: true");
+		String response = get(port, "/c/s/1/registerSingleServletUsingExplicitBatch", "Let-Me-In: true");
 		assertTrue(response.endsWith("file:/something"));
 
-		response = get(port, "/c/s/1");
+		response = get(port, "/c/s/1/registerSingleServletUsingExplicitBatch");
 		assertTrue(response.contains("HTTP/1.1 403"));
 
 		controller.stop();
@@ -451,6 +455,10 @@ public class ServerControllerTest {
 		controller.start();
 
 		Bundle bundle = mock(Bundle.class);
+		BundleWiring wiring = mock(BundleWiring.class);
+		when(bundle.adapt(BundleWiring.class)).thenReturn(wiring);
+		when(wiring.getClassLoader()).thenReturn(this.getClass().getClassLoader());
+
 		ServerModel server = new ServerModel(new SameThreadExecutor());
 
 		WebContainer wc = new HttpServiceEnabled(bundle, controller, server, null, controller.getConfiguration());
@@ -516,10 +524,10 @@ public class ServerControllerTest {
 
 		wc.registerServlet(servlet, "my-servlet", new String[] { "/s/*" }, initParams, context);
 
-		String response = get(port, "/s/1", "Let-Me-In: true");
+		String response = get(port, "/s/1?t=registerSingleServletUsingWebContainer", "Let-Me-In: true");
 		assertTrue(response.endsWith("file:/something"));
 
-		response = get(port, "/s/1");
+		response = get(port, "/s/1?t=registerSingleServletUsingWebContainer");
 		assertTrue(response.contains("HTTP/1.1 403"));
 
 		controller.stop();
@@ -544,7 +552,7 @@ public class ServerControllerTest {
 		// ServletConfig objects (with different - and usually wrong ServletContext)
 		@SuppressWarnings("unchecked")
 		ServiceReference<Servlet> ref = mock(ServiceReference.class);
-		when(context.getService(ref)).thenReturn(new MyHttpServlet());
+		when(context.getService(ref)).thenReturn(new MyHttpServlet("1"));
 
 		Filter filter = new HttpFilter() {
 			@Override
@@ -621,22 +629,22 @@ public class ServerControllerTest {
 
 		// filter -> servlet
 		String response;
-		response = get(port, "/c/s/1");
+		response = get(port, "/c/s/1?t=registerFilterAndServletUsingExcplicitBatch");
 		System.out.println(response);
 		assertTrue(response.contains("my-filter1my-servlet1[/c]my-filter2"));
 
 		// just one filter in the chain, without target servlet
-		response = get(port, "/d/s/1");
+		response = get(port, "/d/s/1?t=registerFilterAndServletUsingExcplicitBatch");
 		System.out.println(response);
 		assertTrue(response.contains("my-filter1my-filter2"));
 
-		// just servlet, because /* filter doesn't use servlet's ServletContextHelper
-		response = get(port, "/c/s2/1");
+		// just servlet, because /* filter doesn't use my-servlet2's ServletContextHelper
+		response = get(port, "/c/s2/1?t=registerFilterAndServletUsingExcplicitBatch");
 		System.out.println(response);
 		assertTrue(response.contains("\r\nmy-servlet2[/c]"));
 
 		// just servlet, because /* filter isn't associated with OsgiContext for /e
-		response = get(port, "/e/s/1");
+		response = get(port, "/e/s/1?t=registerFilterAndServletUsingExcplicitBatch");
 		System.out.println(response);
 		assertTrue(response.contains("\r\nmy-servlet1[/e]"));
 
@@ -680,11 +688,22 @@ public class ServerControllerTest {
 		batch.accept(wc.getServiceModel());
 		controller.sendBatch(batch);
 
+		final int[] id = { 1 };
 		@SuppressWarnings("unchecked")
 		ServiceReference<Servlet> ref = mock(ServiceReference.class);
-		when(context.getService(ref)).thenReturn(new MyHttpServlet());
+		when(context.getService(ref)).thenAnswer(invocation -> new MyHttpServlet(Integer.toString(id[0]++)));
 
 		Filter filter = new HttpFilter() {
+			@Override
+			public void init() {
+				LOG.info("Filter {} initialized in {}", System.identityHashCode(this), getServletContext().getContextPath());
+			}
+
+			@Override
+			public void destroy() {
+				LOG.info("Filter {} destroyed in {}", System.identityHashCode(this), getServletContext().getContextPath());
+			}
+
 			@Override
 			protected void doFilter(HttpServletRequest req, HttpServletResponse resp, FilterChain chain) throws IOException, ServletException {
 				resp.setStatus(HttpServletResponse.SC_OK);
@@ -813,12 +832,24 @@ public class ServerControllerTest {
 		batch.accept(wc.getServiceModel());
 		controller.sendBatch(batch);
 
-		Servlet s11 = new MyIdServlet("1");
-		Servlet s12 = new MyIdServlet("2");
-		Servlet s13 = new MyIdServlet("3");
-		Servlet s14 = new MyIdServlet("4");
-		Servlet s15 = new MyIdServlet("5");
-		Servlet s16 = new MyIdServlet("6");
+		@SuppressWarnings("unchecked")
+		ServiceReference<Servlet> s11 = mock(ServiceReference.class);
+		when(context.getService(s11)).thenAnswer(invocation -> new MyIdServlet("1"));
+		@SuppressWarnings("unchecked")
+		ServiceReference<Servlet> s12 = mock(ServiceReference.class);
+		when(context.getService(s12)).thenAnswer(invocation -> new MyIdServlet("2"));
+		@SuppressWarnings("unchecked")
+		ServiceReference<Servlet> s13 = mock(ServiceReference.class);
+		when(context.getService(s13)).thenAnswer(invocation -> new MyIdServlet("3"));
+		@SuppressWarnings("unchecked")
+		ServiceReference<Servlet> s14 = mock(ServiceReference.class);
+		when(context.getService(s14)).thenAnswer(invocation -> new MyIdServlet("4"));
+		@SuppressWarnings("unchecked")
+		ServiceReference<Servlet> s15 = mock(ServiceReference.class);
+		when(context.getService(s15)).thenAnswer(invocation -> new MyIdServlet("5"));
+		@SuppressWarnings("unchecked")
+		ServiceReference<Servlet> s16 = mock(ServiceReference.class);
+		when(context.getService(s16)).thenAnswer(invocation -> new MyIdServlet("6"));
 
 		long serviceId = 0;
 
@@ -826,7 +857,7 @@ public class ServerControllerTest {
 		wc.doRegisterServlet(Arrays.asList(wcc1, wcc2), new ServletModel.Builder()
 				.withServletName("s1")
 				.withUrlPatterns(new String[] { "/s" })
-				.withServlet(s11)
+				.withServletReference(s11)
 				.withServiceRankAndId(0, ++serviceId)
 				.build());
 
@@ -838,7 +869,7 @@ public class ServerControllerTest {
 		wc.doRegisterServlet(Collections.singletonList(wcc3), new ServletModel.Builder()
 				.withServletName("s1")
 				.withUrlPatterns(new String[] { "/s" })
-				.withServlet(s12)
+				.withServletReference(s12)
 				.withServiceRankAndId(3, ++serviceId)
 				.build());
 
@@ -850,7 +881,7 @@ public class ServerControllerTest {
 		wc.doRegisterServlet(Collections.singletonList(wcc1), new ServletModel.Builder()
 				.withServletName("s1")
 				.withUrlPatterns(new String[] { "/s" })
-				.withServlet(s13)
+				.withServletReference(s13)
 				.withServiceRankAndId(0, ++serviceId)
 				.build());
 
@@ -862,7 +893,7 @@ public class ServerControllerTest {
 		wc.doRegisterServlet(Arrays.asList(wcc2, wcc3), new ServletModel.Builder()
 				.withServletName("s1")
 				.withUrlPatterns(new String[] { "/s" })
-				.withServlet(s14)
+				.withServletReference(s14)
 				.withServiceRankAndId(2, ++serviceId)
 				.build());
 
@@ -879,7 +910,7 @@ public class ServerControllerTest {
 		wc.doRegisterServlet(Arrays.asList(wcc2, wcc4), new ServletModel.Builder()
 				.withServletName("s1")
 				.withUrlPatterns(new String[] { "/s" })
-				.withServlet(s15)
+				.withServletReference(s15)
 				.withServiceRankAndId(1, ++serviceId)
 				.build());
 
@@ -892,7 +923,7 @@ public class ServerControllerTest {
 		wc.doRegisterServlet(Collections.singletonList(wcc4), new ServletModel.Builder()
 				.withServletName("s1")
 				.withUrlPatterns(new String[] { "/s" })
-				.withServlet(s16)
+				.withServletReference(s16)
 				.withServiceRankAndId(0, ++serviceId)
 				.build());
 
@@ -904,7 +935,7 @@ public class ServerControllerTest {
 		// servlet#2 unregistered, s#4 can be activated in /c3 and can be activated in /c2 because s#5 in /c2 is ranked
 		// lower than s#4, so s#5 disabled in /c4, so s#6 enabled in /c4
 		wc.doUnregisterServlet(new ServletModel.Builder()
-				.withServlet(s12)
+				.withServletReference(s12)
 				.withOsgiContextModel(cm3)
 				.remove());
 
@@ -1042,9 +1073,31 @@ public class ServerControllerTest {
 	}
 
 	private static class MyHttpServlet extends HttpServlet {
+
+		private final String id;
+
+		public MyHttpServlet(String id) {
+			this.id = id;
+		}
+
+		@Override
+		public void init() {
+			LOG.info("Servlet {} ({}) initialized in {}", this, System.identityHashCode(this), getServletContext().getContextPath());
+		}
+
+		@Override
+		public void destroy() {
+			LOG.info("Servlet {} ({}) destroyed in {}", this, System.identityHashCode(this), getServletContext().getContextPath());
+		}
+
 		@Override
 		protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
 			resp.getWriter().print(getServletName() + "[" + getServletConfig().getServletContext().getContextPath() + "]");
+		}
+
+		@Override
+		public String toString() {
+			return "S(" + id + ")";
 		}
 	}
 
@@ -1057,8 +1110,13 @@ public class ServerControllerTest {
 		}
 
 		@Override
+		public void init() {
+			LOG.info("Servlet {} ({}) initialized in {}", this, System.identityHashCode(this), getServletContext().getContextPath());
+		}
+
+		@Override
 		public void destroy() {
-			LOG.info("Servlet {} destroyed", this);
+			LOG.info("Servlet {} ({}) destroyed in {}", this, System.identityHashCode(this), getServletContext().getContextPath());
 		}
 
 		@Override
